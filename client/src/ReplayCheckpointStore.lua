@@ -56,43 +56,36 @@ local function decode(data)
   return assert(tables[1], "Empty replay checkpoint")
 end
 
-local nextId = 0
-local openStores = {}
-
 ---@class ReplayCheckpointStore
----@field directory string
 ---@field interval integer
 ---@field latestFrame integer
+---@field checkpoints table<integer, string> Compressed checkpoints keyed by frame.
+---@field compressedBytes integer Total size of the compressed checkpoint data.
 ---@field cachedFrame integer?
 ---@field cachedCheckpoint table? At most one decoded checkpoint is retained.
----@field closed boolean
 ---@overload fun(interval: integer): ReplayCheckpointStore
 local ReplayCheckpointStore = class(
 ---@param self ReplayCheckpointStore
 ---@param interval integer
 function(self, interval)
-  nextId = nextId + 1
-  local id = os.time() .. "-" .. love.timer.getTime() .. "-" .. nextId
-  self.directory = "replay-cache/" .. love.data.encode("string", "hex", love.data.hash("string", "sha256", id))
   self.interval = interval
   self.latestFrame = -interval
-  self.closed = false
-  assert(not love.filesystem.getInfo(self.directory), "Replay checkpoint directory already exists")
-  assert(love.filesystem.createDirectory(self.directory), "Could not create replay checkpoint directory")
-  openStores[self] = true
+  self.checkpoints = {}
+  self.compressedBytes = 0
 end)
 
----Writes a checkpoint without retaining the captured object graph.
+---Retains compressed bytes rather than the captured object graph.
 ---@param frame integer
 ---@param checkpoint table
 function ReplayCheckpointStore:save(frame, checkpoint)
   assert(frame == self.latestFrame + self.interval, "Replay checkpoints must be saved in order")
-  local success, message = love.filesystem.write(self.directory .. "/" .. frame, encode(checkpoint))
-  assert(success, message)
+  local data = encode(checkpoint)
+  self.checkpoints[frame] = data
+  self.compressedBytes = self.compressedBytes + #data
   self.latestFrame = frame
 end
 
----Loads the closest checkpoint at or before frame, retaining only this checkpoint in RAM.
+---Decodes the closest checkpoint at or before frame, caching only one decoded object graph.
 ---@param frame integer
 ---@return table
 function ReplayCheckpointStore:load(frame)
@@ -100,34 +93,20 @@ function ReplayCheckpointStore:load(frame)
   assert(checkpointFrame >= 0, "Replay has no initial checkpoint")
   if checkpointFrame ~= self.cachedFrame then
     self.cachedCheckpoint = nil
-    local data, message = love.filesystem.read(self.directory .. "/" .. checkpointFrame)
-    assert(data, message)
+    local data = assert(self.checkpoints[checkpointFrame], "Replay checkpoint is missing")
     self.cachedCheckpoint = decode(data)
     self.cachedFrame = checkpointFrame
   end
   return self.cachedCheckpoint
 end
 
----Removes only files owned by this playback session.
+---Releases compressed history and the decoded checkpoint when playback ends.
 function ReplayCheckpointStore:close()
-  if self.closed then
-    return
-  end
-  for frame = 0, self.latestFrame, self.interval do
-    assert(love.filesystem.remove(self.directory .. "/" .. frame), "Could not remove replay checkpoint")
-  end
-  assert(love.filesystem.remove(self.directory), "Could not remove replay checkpoint directory")
+  table.clear(self.checkpoints)
+  self.compressedBytes = 0
+  self.latestFrame = -self.interval
   self.cachedCheckpoint = nil
   self.cachedFrame = nil
-  self.closed = true
-  openStores[self] = nil
-end
-
----Also cleans up an open replay when the application exits rather than returning to the browser.
-function ReplayCheckpointStore.closeAll()
-  for store in pairs(openStores) do
-    store:close()
-  end
 end
 
 return ReplayCheckpointStore

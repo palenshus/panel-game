@@ -19,7 +19,7 @@ local ReplayPlayback = class(
 function(self, match)
   assert(match.engine.clock == 0, "Replay seeking must be initialized before playback")
   self.match = match
-  self.store = ReplayCheckpointStore(600)
+  self.store = ReplayCheckpointStore(60)
   self:saveCheckpoint()
 end)
 
@@ -81,7 +81,7 @@ function ReplayPlayback:restoreCheckpoint(checkpoint)
   end
 end
 
----Uses recent snapshots when available; otherwise reconstructs a preceding window from disk.
+---Uses recent snapshots when available; otherwise reconstructs a preceding window from a compressed checkpoint.
 ---@param frame integer
 function ReplayPlayback:rewindToFrame(frame)
   frame = math.max(0, frame)
@@ -148,8 +148,9 @@ function ReplayPlayback:updateSeek(budget)
   return true
 end
 
----Releases this session's temporary checkpoints.
+---Cancels reconstruction and releases this session's checkpoint history.
 function ReplayPlayback:close()
+  self.seekTarget = nil
   self.store:close()
   for _, stack in ipairs(self.match.stacks) do
     stack.isSeeking = false

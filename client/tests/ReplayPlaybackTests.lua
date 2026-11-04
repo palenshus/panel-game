@@ -8,6 +8,7 @@ local GameModes = require("common.data.GameModes")
 local LevelPresets = require("common.data.LevelPresets")
 local ReplayGame = require("client.src.scenes.ReplayGame")
 local input = require("client.src.inputManager")
+local tableUtils = require("common.lib.tableUtils")
 
 local replayDirectory = "common/tests/engine/replays/"
 local shortReplay = "v046-2023-01-28-02-39-32-JamBox-L10-vs-Galadic97-L10-Casual-P1wins.txt"
@@ -49,12 +50,13 @@ local function withReplay(name, test, useScene)
   local scene = useScene and ReplayGame({match = match})
   local playback = scene and scene.playback or ReplayPlayback(match)
   match.replayPlayback = playback
-  local directory = playback.store.directory
   local success, message = xpcall(function()
     test(match, playback, scene)
   end, debug.traceback)
   match:deinit()
-  assert(not love.filesystem.getInfo(directory), "Replay checkpoint directory was not removed")
+  assert(next(playback.store.checkpoints) == nil, "Replay checkpoint history was not released")
+  assert(playback.store.compressedBytes == 0, "Released checkpoint data is still counted")
+  assert(playback.store.cachedCheckpoint == nil, "Decoded checkpoint was not released")
   assert(success, message)
 end
 
@@ -77,14 +79,31 @@ local function seek(playback, frame)
   assert(playback.match.engine.clock == math.max(0, frame), "Seek stopped on the wrong frame")
 end
 
+local function withoutCheckpointFileIO(test)
+  local originalFunctions = {}
+  for _, name in ipairs({"createDirectory", "getInfo", "write", "read", "remove"}) do
+    originalFunctions[name] = love.filesystem[name]
+    love.filesystem[name] = function()
+      error("Checkpoint storage must not use the filesystem")
+    end
+  end
+  local success, message = xpcall(test, debug.traceback)
+  for name, original in pairs(originalFunctions) do
+    love.filesystem[name] = original
+  end
+  assert(success, message)
+end
+
 local function testCheckpointEncoding()
   local store = ReplayCheckpointStore(600)
-  local directory = store.directory
   local chain = {height = 3, linkTimes = {[0] = 15, [30] = 100}}
   local data = {currentChain = chain, stagedGarbage = {chain}, fraction = 1 / 3, binary = "\0\255", flag = false}
   data.self = data
   store:save(0, data)
+  assert(type(store.checkpoints[0]) == "string", "Checkpoint history should contain compressed bytes")
+  chain.height = 99
   local loaded = store:load(0)
+  assert(loaded.currentChain.height == 3, "Checkpoint retained mutable source data")
   assert(loaded.currentChain == loaded.stagedGarbage[1], "Checkpoint lost shared garbage references")
   assert(loaded.self == loaded, "Checkpoint lost cyclic references")
   assert(loaded.currentChain.linkTimes[0] == 15 and loaded.currentChain.linkTimes[30] == 100, "Numeric keys changed")
@@ -92,9 +111,23 @@ local function testCheckpointEncoding()
   assert(loaded.binary == data.binary and loaded.flag == false, "Checkpoint lost scalar data")
   assert(store:load(599) == loaded, "Checkpoint cache did not reuse its single entry")
   store:save(600, {clock = 600})
+  assert(store.compressedBytes == #store.checkpoints[0] + #store.checkpoints[600], "Compressed byte count is incorrect")
   assert(store:load(600).clock == 600, "Checkpoint cache did not replace its entry")
   store:close()
-  assert(not love.filesystem.getInfo(directory), "Checkpoint files were not cleaned up")
+  assert(next(store.checkpoints) == nil and store.compressedBytes == 0, "Compressed checkpoints were not released")
+  assert(store.cachedCheckpoint == nil, "Decoded checkpoint was not released")
+  store:close()
+end
+
+local function testCheckpointStoreCanBeGarbageCollected()
+  local references = setmetatable({}, {__mode = "v"})
+  do
+    local store = ReplayCheckpointStore(60)
+    store:save(0, {clock = 0})
+    references[1] = store
+  end
+  collectgarbage("collect")
+  assert(references[1] == nil, "Checkpoint store was retained after its owner was released")
 end
 
 local function testReconstructionMatchesUninterruptedPlayback()
@@ -173,8 +206,13 @@ local function testClosingDuringReconstruction()
     runUntil(playback, 1800)
     playback:rewindToFrame(600)
     assert(playback.seekTarget, "Expected a seek in progress")
-    ReplayCheckpointStore.closeAll()
-    assert(not love.filesystem.getInfo(playback.store.directory), "Application exit left open replay checkpoints")
+    playback:close()
+    assert(playback.seekTarget == nil, "Closing playback did not cancel reconstruction")
+    assert(next(playback.store.checkpoints) == nil, "Closing playback retained compressed checkpoints")
+    assert(playback.store.cachedCheckpoint == nil, "Closing playback retained a decoded checkpoint")
+    for _, stack in ipairs(match.stacks) do
+      assert(not stack.isSeeking, "Closing playback did not clear its presentation guard")
+    end
   end)
 end
 
@@ -240,11 +278,19 @@ local function testReplaySceneControlsAndGameOver()
       return pressed == key
     end
     local success, message = xpcall(function()
+      assert(scene.playbackSpeeds[scene.playbackSpeedIndex] == 1, "Replay should still start at normal speed")
       local initialWins = {}
       for i, player in ipairs(match.players) do
         initialWins[i] = player.wins
       end
       runUntil(playback, 1800)
+      for _, speed in ipairs({-1, -2, -3, -4, -8, -16}) do
+        scene.playbackSpeedIndex = tableUtils.indexOf(scene.playbackSpeeds, speed)
+        local clock = match.engine.clock
+        scene:runGame()
+        assert(not playback.seekTarget, "A cached reverse step unnecessarily started a seek")
+        assert(match.engine.clock == clock + speed, "Reverse playback did not use the selected speed")
+      end
       playback:rewindToFrame(600)
       input.isDown.Start = 1
       scene:runGame()
@@ -256,14 +302,14 @@ local function testReplaySceneControlsAndGameOver()
       assert(match.engine.clock == 600, "Scene did not complete its paused seek")
       scene:draw()
 
-      scene.playbackSpeedIndex = 1
+      scene.playbackSpeedIndex = tableUtils.indexOf(scene.playbackSpeeds, -16)
       pressed = "Swap1"
       scene:runGame()
       pressed = nil
       scene:runGame()
       assert(match.isPaused and match.engine.clock == 599, "Paused reverse frame advance failed")
       match.isPaused = false
-      scene.playbackSpeedIndex = 4
+      scene.playbackSpeedIndex = tableUtils.indexOf(scene.playbackSpeeds, 1)
       while not match.engine:hasEnded() do
         scene:runGame()
       end
@@ -271,15 +317,37 @@ local function testReplaySceneControlsAndGameOver()
       local winner = match:getWinners()[1]
       local winnerIndex = winner.playerNumber
       assert(winner.wins == initialWins[winnerIndex] + 1, "Game over did not increment the winner once")
-      scene.playbackSpeedIndex = 1
+      scene.playbackSpeedIndex = tableUtils.indexOf(scene.playbackSpeeds, -16)
+      local endClock = match.engine.clock
       scene:runGame()
       assert(not match.ended, "Scene did not rewind out of game over")
+      assert(match.engine.clock == endClock - 16, "Fast rewind out of game over used the wrong speed")
       assert(winner.wins == initialWins[winnerIndex], "Rewinding out of game over did not undo the win")
-      scene.playbackSpeedIndex = 4
+      scene.playbackSpeedIndex = tableUtils.indexOf(scene.playbackSpeeds, 1)
       while not match.engine:hasEnded() do
         scene:runGame()
       end
       assert(winner.wins == initialWins[winnerIndex] + 1, "Replayed game over duplicated the win")
+
+      scene.playbackSpeedIndex = tableUtils.indexOf(scene.playbackSpeeds, -16)
+      local updates = 0
+      local reconstructions = 0
+      while match.engine.clock > 0 or playback.seekTarget do
+        local wasSeeking = playback.seekTarget ~= nil
+        local expectedFrame = playback.seekTarget or math.max(0, match.engine.clock - 16)
+        scene:runGame()
+        if not playback.seekTarget then
+          assert(match.engine.clock == expectedFrame, "Fast reverse playback skipped the requested frame")
+        elseif not wasSeeking then
+          reconstructions = reconstructions + 1
+        end
+        updates = updates + 1
+        assert(updates < 2000, "Fast reverse playback did not finish")
+      end
+      assert(reconstructions > 1, "Fast reverse playback did not cross checkpoint boundaries")
+      assert(winner.wins == initialWins[winnerIndex], "Fast reverse playback did not undo the final win")
+      scene:runGame()
+      assert(match.engine.clock == 0, "Fast reverse playback went past the beginning")
     end, debug.traceback)
     input.isDown = originalIsDown
     input.isPressedWithRepeat = originalRepeat
@@ -287,7 +355,7 @@ local function testReplaySceneControlsAndGameOver()
   end, true)
 end
 
-local function testTenMinuteReplayKeepsSnapshotStorageBounded()
+local function testTenMinuteReplayUsesCompressedHistory()
   withReplay(longReplay, function(match, playback)
     runUntil(playback, 18000)
     collectgarbage("collect")
@@ -309,24 +377,34 @@ local function testTenMinuteReplayKeepsSnapshotStorageBounded()
       assert(stack.engine.rollbackBuffer.buffer == originalBuffers[i], "Seeking allocated a second rollback buffer")
       assert(#stack.engine.rollbackBuffer.buffer == stack.engine.rollbackBuffer.size, "Rollback storage grew")
     end
-    assert(playback.store.latestFrame == 36000, "Checkpoints were not generated every ten seconds")
-    assert(playback.store.cachedFrame == 17400, "Seek did not use the nearest checkpoint before the refill window")
+    assert(playback.store.interval == 60, "Replay checkpoints should be saved every second")
+    assert(playback.store.latestFrame == 36000, "Checkpoints were not generated throughout the replay")
+    assert(playback.store.cachedFrame == 17700, "Seek did not use the nearest checkpoint before the refill window")
     assert(endMemory - halfwayMemory < 16 * 1024, "Replay checkpoint RAM grew by more than 16 MiB over five minutes")
-    logger.info(string.format("Replay rewind: 10-minute memory growth %.2f MiB; distant seek %.3fs",
-      (endMemory - halfwayMemory) / 1024, seekSeconds))
+    local compressedBytes = 0
+    for _, data in pairs(playback.store.checkpoints) do
+      assert(type(data) == "string", "An uncompressed checkpoint was retained in history")
+      compressedBytes = compressedBytes + #data
+    end
+    assert(playback.store.compressedBytes == compressedBytes, "Checkpoint byte count does not match retained data")
+    assert(compressedBytes < 12 * 1024 * 1024, "Ten-minute replay used more than 12 MiB of compressed checkpoints")
+    logger.info(string.format(
+      "Replay rewind: compressed history %.2f MiB; five-to-ten-minute Lua memory growth %.2f MiB; distant seek %.3fs",
+      compressedBytes / 1024 / 1024, (endMemory - halfwayMemory) / 1024, seekSeconds))
     seek(playback, 0)
     assert(match.engine.clock == 0, "Ten-minute replay could not rewind to the beginning")
-    assert(#love.filesystem.getDirectoryItems(playback.store.directory) == 61,
-      "Expected one disk checkpoint per ten seconds plus frame zero")
+    assert(tableUtils.length(playback.store.checkpoints) == 601,
+      "Expected one compressed checkpoint per second plus frame zero")
   end)
 end
 
-testCheckpointEncoding()
+withoutCheckpointFileIO(testCheckpointEncoding)
+testCheckpointStoreCanBeGarbageCollected()
 testReconstructionMatchesUninterruptedPlayback()
 testFrameBoundariesAndPausedSeeking()
 testContinuousRewindCrossesBufferBoundaries()
 testSeekBudgetsAndSideEffects()
 testModernPanelGeneratorAndSimulatedOpponent()
 testReplaySceneControlsAndGameOver()
-testTenMinuteReplayKeepsSnapshotStorageBounded()
+testTenMinuteReplayUsesCompressedHistory()
 testClosingDuringReconstruction()

@@ -9,15 +9,17 @@ The speed indicator shows "..." while reconstruction is in progress; controls
 remain responsive, although crossing a rollback-window boundary may briefly pause
 backward playback. Smooth background prefetching is not implemented.
 
-Checkpoints are generated every 10 seconds during playback and compressed into
-temporary files under replay-cache in the LOVE save directory. Only one decoded
-checkpoint is cached in RAM, and reconstruction reuses the existing rollback
-window rather than allocating another frame buffer. Disk usage grows with replay
-length; inputs and engine history also retain their existing memory costs.
-Checkpoint files are removed when the replay viewer or application closes normally. A crash may
-leave a session directory behind; replay-cache can be deleted when no replay
-viewer is running. Checkpoints are not shared across sessions, and existing
-replay files are unchanged.
+Left/right selects playback speeds from -16x to 16x. While paused, frame advance
+moves exactly one frame in the selected direction, even at faster playback speeds.
+
+Checkpoints are generated every second during playback and retained as compressed
+data in RAM. Only one decoded checkpoint is cached, and reconstruction reuses the
+existing rollback window rather than allocating another frame buffer. No checkpoint
+files are written to disk. Compressed history is kept for the entire replay, without
+a memory cap; its size grows with replay length and the amount of game state.
+Inputs and engine history also retain their existing memory costs. Checkpoint
+memory is released when the replay viewer closes. Checkpoints are not shared
+across sessions, and existing replay files are unchanged.
 
 "in_buf" and "I" represent P1's and P2's inputs, respectively. Every character represents a frame.
 

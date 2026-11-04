@@ -7,12 +7,13 @@ local GraphicsUtil = require("client.src.graphics.graphics_util")
 local prof = require("common.lib.zoneProfiler")
 local DebugSettings = require("client.src.debug.DebugSettings")
 local ReplayPlayback = require("client.src.ReplayPlayback")
+local tableUtils = require("common.lib.tableUtils")
 
 local ReplayGame = class(
   function (self, sceneParams)
     self.frameAdvance = false
-    self.playbackSpeeds = {-1, 0, 0.5, 1, 2, 3, 4, 8, 16}
-    self.playbackSpeedIndex = 4
+    self.playbackSpeeds = {-16, -8, -4, -3, -2, -1, 0, 0.5, 1, 2, 3, 4, 8, 16}
+    self.playbackSpeedIndex = tableUtils.indexOf(self.playbackSpeeds, 1)
     self.saveReplay = false
     self:load()
     self.playback = ReplayPlayback(self.match)
